@@ -1,0 +1,99 @@
+How the queries will work?
+1.What I know, based on:
+	A.Firewall Violations (Requests exceeding body length limits (potential exploit attempts) - Example: Request body length exceeded the limit (131072 bytes))
+	B.Access Anomalies High Request Rates : IPs making >50 requests/hour (possible scraping/brute force) 
+	C.Sensitive Endpoints : Access to URIs like /ajaxpro, /login, or /admin (common attack targets) 
+	D.Monitor Sensitive URIs : Add endpoints specific (sensitive pages, /api, /config)
+2.What I dont Know, base on
+	1.Add Threat Intel : Cross-reference ClientIp with Microsoft Sentinel Threat Intelligence tables 
+
+
+
+-------------------------------------------------------------
+
+let sensitivePaths = dynamic(["/ajaxpro", "/login", "/admin", "/api", "/config"]);
+let highRequestRate = 
+    workspace("waflogs").AGWFirewallLogs
+    | where RequestUri has_any(sensitivePaths)
+    | summarize RequestCount = count() by ClientIp, bin(TimeGenerated, 1h)
+    | where RequestCount > 50
+    | project ClientIp, TimeGenerated, DetectionType = "High Request Rate";
+let threatIntel = 
+    ThreatIntelligenceIndicator
+    | where isnotempty(NetworkSourceIP)
+    | project ClientIp = NetworkSourceIP, ThreatType, ConfidenceScore, Description;
+workspace("waflogs").AGWFirewallLogs
+| extend DetectionType = case(
+    Message has "Request body length exceeded the limit", "Firewall Violation",
+    RequestUri has_any(sensitivePaths), "Sensitive Endpoint Access",
+    "Unknown"
+)
+| join kind=leftouter (highRequestRate) on ClientIp, TimeGenerated
+| extend DetectionType = iff(isnotempty(DetectionType1), DetectionType1, DetectionType)
+| join kind=leftouter (threatIntel) on ClientIp
+| where DetectionType != "Unknown" or isnotempty(ThreatType)
+| project TimeGenerated, ClientIp, RequestUri, DetectionType, ThreatType, ConfidenceScore, Description
+
+---------------------------------------------------------------------
+AGWFirewallLogs
+| where Message has "Request body length exceeded the limit"
+| summarize 
+    RequestCount = count(), 
+    SuspiciousURIs = make_set(RequestUri), 
+    TimeGenerated = max(TimeGenerated)
+    by ClientIp
+| extend DetectionType = "Firewall Violation"
+| project TimeGenerated, ClientIp, RequestCount, SuspiciousURIs, DetectionType
+| sort by RequestCount desc
+--------------------------------------------------------------------------------------
+
+workspace("waflogs").AGWFirewallLogs
+| where RequestUri startswith "/ajaxpro"
+    or RequestUri startswith "/login"
+    or RequestUri startswith "/admin"
+    or RequestUri startswith "/api"
+    or RequestUri startswith "/config"
+| summarize AccessCount = count(), LastSeen = max(TimeGenerated)
+    by ClientIp, RequestUri
+| extend DetectionType = "Sensitive Endpoint Access"
+| project TimeGenerated = LastSeen, ClientIp, RequestUri, AccessCount, DetectionType
+| sort by AccessCount desc
+
+-------------------------------------------------------------------------------------
+workspace("waflogs").AGWFirewallLogs
+| join kind=inner (
+    ThreatIntelligenceIndicator 
+    | where isnotempty(NetworkSourceIP)
+    | project IpAddress = NetworkSourceIP, ThreatType, Confidence = ConfidenceScore
+) on $left.ClientIp == $right.IpAddress
+| extend DetectionType = "Threat Intel Match"
+| project TimeGenerated, ClientIp, ThreatType, Confidence, DetectionType
+---------------------------------------------------------------------------------
+let sensitivePaths = dynamic(["/ajaxpro", "/login", "/admin", "/api", "/config"]);
+// High Request Rate calculation in a separate step
+let highRequestRate = workspace("waflogs").AGWFirewallLogs
+| where RequestUri startswith "/ajaxpro"
+    or RequestUri startswith "/login"
+    or RequestUri startswith "/admin"
+    or RequestUri startswith "/api"
+    or RequestUri startswith "/config"
+| summarize RequestCount = count() by ClientIp, bin(TimeGenerated, 1h)
+| where RequestCount > 50
+| project ClientIp, DetectionType = "High Request Rate", TimeGenerated;
+// Main query
+workspace("waflogs").AGWFirewallLogs
+| extend DetectionType = case(
+    Message == "Request body length exceeded the limit (131072 bytes)", "Firewall Violation",
+    RequestUri startswith "/ajaxpro" or RequestUri startswith "/login" or RequestUri startswith "/admin" or RequestUri startswith "/api" or RequestUri startswith "/config", "Sensitive Endpoint Access",
+    "Unknown"
+)
+| join kind=leftouter (
+    ThreatIntelligenceIndicator 
+    | where isnotempty(NetworkSourceIP)
+    | project ClientIp = NetworkSourceIP, ThreatType, ConfidenceScore
+) on ClientIp
+| join kind=leftouter (highRequestRate) on ClientIp, TimeGenerated
+| extend DetectionType = coalesce(DetectionType, "Unknown")
+| where DetectionType != "Unknown" or isnotempty(ThreatType)
+| project TimeGenerated, ClientIp, RequestUri, DetectionType, ThreatType, ConfidenceScore
+| sort by TimeGenerated desc
