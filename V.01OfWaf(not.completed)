@@ -1,0 +1,112 @@
+🔹 1. High Request Rate Detection
+Detects IPs making more than 50 requests per hour to sensitive endpoints.
+
+kql
+Copy
+Edit
+let sensitivePaths = dynamic(["/ajaxpro", "/login", "/admin", "/api", "/config"]);
+let highRequestRate = 
+    workspace("waflogs").AGWFirewallLogs
+    | where tolower(RequestUri) startswith "/ajaxpro" 
+        or tolower(RequestUri) startswith "/login"
+        or tolower(RequestUri) startswith "/admin"
+        or tolower(RequestUri) startswith "/api"
+        or tolower(RequestUri) startswith "/config"
+    | summarize RequestCount = count() by ClientIp, bin(TimeGenerated, 1h)
+    | where RequestCount > 50
+    | project ClientIp, TimeGenerated, DetectionType = "High Request Rate";
+🔹 2. Threat Intelligence Matching
+Matches WAF logs to threat intelligence indicators from Microsoft.
+
+kql
+Copy
+Edit
+let threatIntel = 
+    ThreatIntelligenceIndicator
+    | where isnotempty(NetworkSourceIP)
+    | where ConfidenceScore >= 80
+    | project ClientIp = NetworkSourceIP, ThreatType, ConfidenceScore, Description, TimeGenerated;
+🔹 3. Combined Detection Query
+Combines firewall violations, high request rates, sensitive endpoints, and threat intel into one detection output.
+
+kql
+Copy
+Edit
+let sensitivePaths = dynamic(["/ajaxpro", "/login", "/admin", "/api", "/config"]);
+
+let highRequestRate = 
+    workspace("waflogs").AGWFirewallLogs
+    | where tolower(RequestUri) startswith "/ajaxpro" 
+        or tolower(RequestUri) startswith "/login"
+        or tolower(RequestUri) startswith "/admin"
+        or tolower(RequestUri) startswith "/api"
+        or tolower(RequestUri) startswith "/config"
+    | summarize RequestCount = count() by ClientIp, bin(TimeGenerated, 1h)
+    | where RequestCount > 50
+    | project ClientIp, TimeGenerated, DetectionType = "High Request Rate";
+
+let threatIntel = 
+    ThreatIntelligenceIndicator
+    | where isnotempty(NetworkSourceIP)
+    | where ConfidenceScore >= 80
+    | project ClientIp = NetworkSourceIP, ThreatType, ConfidenceScore, Description, TI_Time = TimeGenerated;
+
+workspace("waflogs").AGWFirewallLogs
+| extend DetectionType = case(
+    Message has "Request body length exceeded", "Firewall Violation",
+    tolower(RequestUri) startswith "/ajaxpro" or tolower(RequestUri) startswith "/login" or tolower(RequestUri) startswith "/admin" or tolower(RequestUri) startswith "/api" or tolower(RequestUri) startswith "/config", "Sensitive Endpoint Access",
+    "Unknown"
+)
+| join kind=leftouter (highRequestRate) on ClientIp
+| extend DetectionType = coalesce(DetectionType1, DetectionType)
+| join kind=leftouter (threatIntel) on ClientIp
+| where DetectionType != "Unknown" or isnotempty(ThreatType)
+| project TimeGenerated, ClientIp, RequestUri, DetectionType, ThreatType, ConfidenceScore, Description
+🔹 4. Firewall Violation Summary
+Summarizes IPs that triggered WAF body size limit violations.
+
+kql
+Copy
+Edit
+workspace("waflogs").AGWFirewallLogs
+| where Message has "Request body length exceeded"
+| summarize 
+    RequestCount = count(), 
+    SuspiciousURIs = make_set(RequestUri), 
+    TimeGenerated = max(TimeGenerated)
+    by ClientIp
+| extend DetectionType = "Firewall Violation"
+| project TimeGenerated, ClientIp, RequestCount, SuspiciousURIs, DetectionType
+| sort by RequestCount desc
+🔹 5. Sensitive Endpoint Access Detection
+Counts and lists attempts to access sensitive endpoints (e.g., /login, /admin).
+
+kql
+Copy
+Edit
+let sensitivePaths = dynamic(["/ajaxpro", "/login", "/admin", "/api", "/config"]);
+workspace("waflogs").AGWFirewallLogs
+| where tolower(RequestUri) startswith "/ajaxpro" 
+    or tolower(RequestUri) startswith "/login"
+    or tolower(RequestUri) startswith "/admin"
+    or tolower(RequestUri) startswith "/api"
+    or tolower(RequestUri) startswith "/config"
+| summarize AccessCount = count(), LastSeen = max(TimeGenerated) by ClientIp, RequestUri
+| extend DetectionType = "Sensitive Endpoint Access"
+| project TimeGenerated = LastSeen, ClientIp, RequestUri, AccessCount, DetectionType
+| sort by AccessCount desc
+🔹 6. Threat Intelligence Join (Standalone)
+Only shows WAF logs that match known threat intelligence indicators.
+
+kql
+Copy
+Edit
+workspace("waflogs").AGWFirewallLogs
+| join kind=inner (
+    ThreatIntelligenceIndicator 
+    | where isnotempty(NetworkSourceIP)
+    | where ConfidenceScore >= 80
+    | project IpAddress = NetworkSourceIP, ThreatType, ConfidenceScore
+) on $left.ClientIp == $right.IpAddress
+| extend DetectionType = "Threat Intel Match"
+| project TimeGenerated, ClientIp, ThreatType, ConfidenceScore, DetectionType
